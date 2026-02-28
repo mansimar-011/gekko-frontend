@@ -105,19 +105,75 @@ export default function Gekko() {
     else setLocalLog(p => [...p, { sender: "SYSTEM", time: ts(), text: "Not connected to backend.", type: "alert" }]);
   };
 
+  const [aiThinking, setAiThinking] = useState(false);
   const handleLogin = () => window.open(`${BACKEND}/login`, "_blank");
 
-  const sendMsg = () => {
+  const sendMsg = async () => {
     const m = input.toLowerCase().trim();
-    if (!m) return;
-    setLocalLog(p => [...p, { sender: "YOU", time: ts(), text: input, type: "info" }]);
+    const raw = input.trim();
+    if (!raw) return;
+    setLocalLog(p => [...p, { sender: "YOU", time: ts(), text: raw, type: "info" }]);
     setInput("");
-    if (m.includes("strategy a") || m.includes("credit spread")) sendWs({ cmd: "start_strategy", strategy: "A" });
-    else if (m.includes("strategy b") || m.includes("iron condor")) sendWs({ cmd: "start_strategy", strategy: "B" });
-    else if (m.includes("stop") || m.includes("close")) sendWs({ cmd: "stop" });
-    else if (m.includes("scan") || m.includes("status")) sendWs({ cmd: "scan" });
-    else if (m.includes("login")) handleLogin();
-    else setLocalLog(p => [...p, { sender: "GEKKO", time: ts(), text: "Commands: 'Strategy A' · 'Strategy B' · 'stop' · 'scan' · 'login'", type: "info" }]);
+
+    // Trading commands — handle directly
+    if (m.includes("strategy a") || m.includes("credit spread")) { sendWs({ cmd: "start_strategy", strategy: "A" }); return; }
+    if (m.includes("strategy b") || m.includes("iron condor")) { sendWs({ cmd: "start_strategy", strategy: "B" }); return; }
+    if (m.includes("stop all") || m.includes("close all")) { sendWs({ cmd: "stop" }); return; }
+    if (m === "stop" || m === "close") { sendWs({ cmd: "stop" }); return; }
+    if (m.includes("login")) { handleLogin(); return; }
+
+    // Everything else — send to Claude AI
+    setAiThinking(true);
+    try {
+      const context = snap ? `
+Current market state:
+- Nifty Spot: ${snap.spot}
+- VIX: ${snap.vix}
+- IV Rank: ${snap.iv_rank}
+- Active Strategy: ${snap.active_strategy || "None"}
+- Open Positions: ${snap.positions?.length || 0}
+- Session P&L: ₹${snap.session_pnl?.toFixed(0) || 0} (${snap.pnl_pct?.toFixed(3) || 0}%)
+- Zerodha Auth: ${snap.auth}
+- Top overpriced options: ${snap.option_chain?.filter(o => o.overpriced).slice(0, 3).map(o => `${o.strike}${o.type} IV:${o.iv}% mismatch:+${o.iv_mismatch}σ`).join(", ") || "scanning..."}
+` : "Market data loading...";
+
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-20250514",
+          max_tokens: 1000,
+          system: `You are GEKKO, an expert AI trading assistant for Nifty options trading on NSE India. You help the trader make smart decisions about options strategies, IV analysis, Greeks interpretation, and risk management.
+
+You have access to live market data and can advise on:
+- Whether to start Strategy A (IV Credit Spread) or Strategy B (Iron Condor)
+- Reading IV mismatches and Greeks (delta, gamma, theta, vega)
+- When to take profits or cut losses
+- General options trading education
+- Market conditions and what they mean
+
+Trading controls available:
+- "start strategy a" or "start strategy b" to activate
+- "stop" to close all positions
+
+Keep responses concise and actionable. You're speaking to a trader on their iPhone. Current market context: ${context}`,
+          messages: [{ role: "user", content: raw }]
+        })
+      });
+
+      const data = await response.json();
+      const reply = data.content?.[0]?.text || "Sorry, I couldn't process that.";
+      setLocalLog(p => [...p, { sender: "GEKKO", time: ts(), text: reply, type: "info" }]);
+    } catch (e) {
+      // Fallback if API fails
+      if (m.includes("scan") || m.includes("status")) {
+        sendWs({ cmd: "scan" });
+      } else {
+        setLocalLog(p => [...p, { sender: "GEKKO", time: ts(), text: `Spot: ${snap?.spot || "--"} | VIX: ${snap?.vix || "--"} | IV Rank: ${snap?.iv_rank || "--"} | P&L: ₹${snap?.session_pnl?.toFixed(0) || 0}`, type: "info" }]);
+      }
+    } finally {
+      setAiThinking(false);
+    }
   };
 
   const C = { bg: "#06090a", panel: "#080c0d", border: "#0f1a1a", green: "#00ffc8", orange: "#ff6b35", red: "#ff4466", yellow: "#f0c040" };
@@ -215,18 +271,39 @@ export default function Gekko() {
         {tab === "chat" && <>
           <div ref={chatRef} style={{ flex: 1, overflowY: "auto", padding: "12px 16px" }}>
             {logItems.map((m, i) => (
-              <div key={i} className="ll">
-                <span style={{ color: "#333", fontSize: 10, minWidth: 38 }}>{m.time}</span>
-                <span style={{ minWidth: 52, fontSize: 10, fontWeight: 600, color: m.sender === "GEKKO" ? C.green : m.sender === "SYSTEM" ? C.yellow : "#777" }}>{m.sender}</span>
-                <span style={{ fontSize: 11, flex: 1, color: m.type === "trade" ? C.orange : m.type === "alert" ? "#ffcc44" : "#888" }}>{m.text}</span>
+              <div key={i} className="ll" style={{ flexDirection: "column", gap: 2 }}>
+                <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                  <span style={{ color: "#333", fontSize: 10, minWidth: 38 }}>{m.time}</span>
+                  <span style={{ fontSize: 10, fontWeight: 600, color: m.sender === "GEKKO" ? C.green : m.sender === "SYSTEM" ? C.yellow : "#aaa" }}>{m.sender}</span>
+                </div>
+                <div style={{ fontSize: 12, color: m.type === "trade" ? C.orange : m.type === "alert" ? "#ffcc44" : m.sender === "YOU" ? "#fff" : "#999", paddingLeft: 48, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{m.text}</div>
               </div>
             ))}
-            {running && <div className="ll" style={{ marginTop: 4 }}><span style={{ color: "#333", fontSize: 10, minWidth: 38 }} /><span style={{ color: C.green, fontSize: 10, minWidth: 52 }}>GEKKO</span><span style={{ color: "#1a3a2a", animation: "pulse 1.2s infinite", fontSize: 11 }}>● monitoring...</span></div>}
+            {(running || aiThinking) && (
+              <div className="ll" style={{ flexDirection: "column", gap: 2 }}>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <span style={{ color: "#333", fontSize: 10, minWidth: 38 }}></span>
+                  <span style={{ color: C.green, fontSize: 10, fontWeight: 600 }}>GEKKO</span>
+                </div>
+                <div style={{ paddingLeft: 48, color: "#1a4a2a", animation: "pulse 1.2s infinite", fontSize: 11 }}>
+                  {aiThinking ? "● thinking..." : "● monitoring positions..."}
+                </div>
+              </div>
+            )}
           </div>
-          <div style={{ borderTop: `1px solid ${C.border}`, padding: "10px 16px", display: "flex", alignItems: "center", gap: 10, background: C.panel }}>
-            <span style={{ color: C.green }}>›</span>
-            <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => e.key === "Enter" && sendMsg()} placeholder="'Strategy A' · 'Strategy B' · 'stop' · 'scan' · 'login'" />
-            <button className="btn G" onClick={sendMsg}>SEND ↵</button>
+          <div style={{ borderTop: `1px solid ${C.border}`, padding: "12px 16px", paddingBottom: "calc(12px + env(safe-area-inset-bottom))", display: "flex", alignItems: "center", gap: 10, background: C.panel, position: "sticky", bottom: 0 }}>
+            <span style={{ color: C.green, fontSize: 16 }}>›</span>
+            <input
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && !aiThinking && sendMsg()}
+              placeholder="Ask GEKKO anything about the market..."
+              style={{ fontSize: 13, padding: "4px 0" }}
+              disabled={aiThinking}
+            />
+            <button className="btn G" onClick={sendMsg} disabled={aiThinking} style={{ minWidth: 60 }}>
+              {aiThinking ? "..." : "SEND"}
+            </button>
           </div>
         </>}
 
